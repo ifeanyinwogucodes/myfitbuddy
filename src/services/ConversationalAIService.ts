@@ -10,6 +10,7 @@ import {
   ApiResponse 
 } from '../types';
 import { createError } from '../middleware/errorHandler';
+import { config } from '../config';
 
 export interface AIResponse {
   message: string;
@@ -69,18 +70,94 @@ export class ConversationalAIService {
         userResult = await this.userService.getUserByTelegramId(userId);
       }
       
+      // If user doesn't exist and we have a telegramId, create a basic user profile
       if (!userResult.success || !userResult.data) {
-        throw createError('User not found', 404);
+        if (!ObjectId.isValid(userId)) {
+          // Check if database is connected before trying to create user
+          if (!database.isConnected()) {
+            console.warn('⚠️  Database not connected, using temporary user context');
+            // Create a temporary user object for AI context (won't be saved)
+            const tempUser: User = {
+              _id: new ObjectId(),
+              telegramId: userId,
+              profile: {
+                name: 'User',
+                age: 25,
+                height: 170,
+                weight: 70,
+                bmi: 24.2,
+                fitnessGoal: 'maintain',
+                trainingPhilosophy: 'custom',
+                experienceLevel: 'beginner',
+              },
+              schedule: {
+                workDays: [],
+                availableHours: [],
+                preferredWorkoutDuration: 60,
+                workoutDaysPerWeek: 3,
+              },
+              preferences: {
+                reminderFrequency: 'daily',
+                humorEnabled: true,
+                conversationStyle: 'casual',
+              },
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            userResult = { success: true, data: tempUser };
+          } else {
+            // This is a telegramId, create a new user
+            console.log(`Creating new user for telegramId: ${userId}`);
+            const newUserResult = await this.userService.createUser({
+              telegramId: userId,
+              profile: {
+                name: 'User', // Will be updated during onboarding
+                age: 25, // Default, will be updated
+                height: 170, // Default, will be updated
+                weight: 70, // Default, will be updated
+                bmi: 24.2, // Default, will be recalculated
+                fitnessGoal: 'maintain' as const,
+                trainingPhilosophy: 'custom' as const,
+                experienceLevel: 'beginner' as const,
+              },
+            });
+            
+            if (newUserResult.success && newUserResult.data) {
+              userResult = newUserResult;
+            } else {
+              console.error('Failed to create new user:', newUserResult.error);
+              throw createError('Failed to create user profile', 500);
+            }
+          }
+        } else {
+          throw createError('User not found', 404);
+        }
       }
 
       const user = userResult.data;
-      if (!user._id) {
+      if (!user || !user._id) {
         throw createError('User ID is missing', 500);
       }
       const actualUserId = user._id.toString();
       
-      // Get or create conversation using the actual user ObjectId
-      let conversation = await this.getOrCreateConversation(actualUserId, context);
+      // Get or create conversation using the actual user ObjectId (only if DB is connected)
+      let conversation: Conversation | null = null;
+      if (database.isConnected()) {
+        conversation = await this.getOrCreateConversation(actualUserId, context);
+      } else {
+        // Create in-memory conversation if DB not connected
+        conversation = {
+          userId: user._id,
+          messages: [],
+          context: context || {
+            currentActivity: undefined,
+            sessionData: {},
+            lastInteraction: new Date(),
+          },
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+      }
       
       // Add user message to conversation
       const userMessage: Message = {
@@ -112,8 +189,10 @@ export class ConversationalAIService {
       };
       conversation.messages.push(aiMessage);
 
-      // Update conversation in database
-      await this.saveConversation(conversation);
+      // Update conversation in database (only if connected)
+      if (database.isConnected()) {
+        await this.saveConversation(conversation);
+      }
 
       // Generate suggestions based on context
       const suggestions = this.generateSuggestions(updatedContext, user);
@@ -133,12 +212,29 @@ export class ConversationalAIService {
       };
     } catch (error: any) {
       console.error('Error processing message:', error);
+      console.error('Error details:', {
+        code: error.name || error.code,
+        message: error.message,
+        stack: error.stack,
+      });
+      
+      // Provide more specific error messages
+      let userMessage = 'I\'m having trouble understanding right now. Could you try rephrasing that?';
+      
+      if (error.message?.includes('User not found') || error.message?.includes('User ID is missing')) {
+        userMessage = 'I need to set up your profile first. Please send /start to begin!';
+      } else if (error.message?.includes('OpenRouter') || error.message?.includes('AI service')) {
+        userMessage = 'I\'m having trouble connecting to my AI service. Please try again in a moment!';
+      } else if (error.message?.includes('Database') || error.message?.includes('MongoDB')) {
+        userMessage = 'I\'m having database issues. Please try again in a moment!';
+      }
+      
       return {
         success: false,
         error: {
           code: error.name || 'MESSAGE_PROCESSING_ERROR',
           message: error.message,
-          userMessage: 'I\'m having trouble understanding right now. Could you try rephrasing that?',
+          userMessage,
         },
       };
     }

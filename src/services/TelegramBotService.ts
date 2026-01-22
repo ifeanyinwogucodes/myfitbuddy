@@ -11,6 +11,8 @@ export class TelegramBotService {
   private isRunning: boolean = false;
 
   constructor() {
+    // Disable polling by default to avoid conflicts
+    // We'll start polling manually after checking for existing instances
     this.bot = new TelegramBot(config.telegram.botToken, { polling: false });
     this.aiService = new ConversationalAIService();
     this.userService = new UserService();
@@ -28,10 +30,31 @@ export class TelegramBotService {
 
       // Set up webhook if in production, polling if in development
       if (config.server.nodeEnv === 'production' && config.telegram.webhookUrl) {
+        // Delete any existing polling before setting webhook
+        try {
+          await this.bot.deleteWebHook();
+        } catch (error) {
+          // Ignore errors
+        }
         await this.bot.setWebHook(config.telegram.webhookUrl);
         console.log(`🤖 Telegram bot webhook set to: ${config.telegram.webhookUrl}`);
       } else {
         // Use polling for development
+        // First, delete any existing webhook to avoid conflicts
+        try {
+          await this.bot.deleteWebHook();
+          console.log('🗑️  Deleted any existing webhooks');
+        } catch (error: any) {
+          // Ignore errors if webhook doesn't exist
+          if (error.response?.error_code !== 404) {
+            console.warn('Warning when deleting webhook:', error.message);
+          }
+        }
+        
+        // Wait a moment to ensure webhook deletion is processed
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Start polling
         this.bot.startPolling();
         console.log('🤖 Telegram bot started with polling');
       }
@@ -129,8 +152,46 @@ export class TelegramBotService {
     });
 
     // Handle errors
-    this.bot.on('error', (error) => {
+    this.bot.on('error', (error: any) => {
       console.error('Telegram bot error:', error);
+      
+      // Handle polling conflicts (409 errors)
+      if (error.code === 'ETELEGRAM' && (error.response?.error_code === 409 || error.message?.includes('409'))) {
+        console.error('⚠️  Polling conflict detected (409). Another bot instance may be running.');
+        console.error('   Solutions:');
+        console.error('   1. Stop all other bot instances');
+        console.error('   2. Delete webhook if set: curl -X POST https://api.telegram.org/bot<TOKEN>/deleteWebhook');
+        console.error('   3. Wait a few seconds and restart');
+        // Don't crash, just log the error
+      }
+    });
+    
+    // Handle polling errors specifically
+    this.bot.on('polling_error', (error: any) => {
+      if (error.code === 'ETELEGRAM' && (error.response?.error_code === 409 || error.message?.includes('409'))) {
+        console.error('⚠️  Polling error (409): Multiple instances detected');
+        console.error('   This usually means:');
+        console.error('   - Another server instance is running');
+        console.error('   - A webhook is still active');
+        console.error('   - Another bot with the same token is running');
+        // Try to recover by stopping and restarting polling
+        setTimeout(async () => {
+          try {
+            await this.bot.stopPolling();
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            await this.bot.deleteWebHook();
+            await this.bot.startPolling();
+            console.log('🔄 Restarted polling after conflict');
+          } catch (recoverError) {
+            console.error('Failed to recover from polling conflict:', recoverError);
+          }
+        }, 5000);
+      } else {
+        console.error('Polling error:', error);
+        // Stop polling to avoid continuous errors
+        this.bot.stopPolling();
+        this.isRunning = false;
+      }
     });
   }
 
@@ -369,6 +430,8 @@ Just start chatting with me naturally! 😊`;
 
       if (!telegramId || !messageText) return;
 
+      console.log(`📨 Processing message from ${telegramId}: ${messageText.substring(0, 50)}...`);
+
       // Process message through AI service
       const aiResponse = await this.aiService.processMessage(telegramId, messageText);
 
@@ -391,12 +454,23 @@ Just start chatting with me naturally! 😊`;
           });
         }
       } else {
+        // Log the error for debugging
+        console.error('❌ AI Service Error:', {
+          code: aiResponse.error?.code,
+          message: aiResponse.error?.message,
+          userMessage: aiResponse.error?.userMessage,
+        });
+        
         await this.bot.sendMessage(msg.chat.id, 
           aiResponse.error?.userMessage || 'I\'m having trouble understanding right now. Could you try rephrasing that? 🤔'
         );
       }
-    } catch (error) {
-      console.error('Error handling text message:', error);
+    } catch (error: any) {
+      console.error('❌ Error handling text message:', {
+        error: error.message,
+        stack: error.stack,
+        telegramId: msg.from?.id,
+      });
       await this.bot.sendMessage(msg.chat.id, 
         'I\'m having some technical difficulties. Please try again in a moment! 🔧'
       );
