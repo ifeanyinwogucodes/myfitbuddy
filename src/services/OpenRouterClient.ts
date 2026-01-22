@@ -36,8 +36,26 @@ export class OpenRouterClient {
   private baseUrl: string;
 
   constructor() {
-    this.apiKey = config.openRouter.apiKey;
+    this.apiKey = config.openRouter.apiKey?.trim() || '';
     this.baseUrl = config.openRouter.baseUrl;
+    
+    // Validate API key on construction
+    if (!this.apiKey || this.apiKey === '') {
+      console.warn('⚠️  OpenRouter API key is not set. AI features will not work.');
+      console.warn('   Set OPENROUTER_API_KEY in your .env file to enable AI responses.');
+    } else {
+      // Log partial key for verification (first 10 chars + last 4 chars)
+      const keyPreview = this.apiKey.length > 14 
+        ? `${this.apiKey.substring(0, 10)}...${this.apiKey.substring(this.apiKey.length - 4)}`
+        : '***';
+      console.log(`✅ OpenRouter API key loaded: ${keyPreview}`);
+      
+      // Check key format
+      if (!this.apiKey.startsWith('sk-or-v1-') && !this.apiKey.startsWith('Sk-or-v1-')) {
+        console.warn('⚠️  Warning: OpenRouter API key format looks unusual.');
+        console.warn('   Expected format: sk-or-v1-... (all lowercase)');
+      }
+    }
   }
 
   /**
@@ -60,10 +78,17 @@ export class OpenRouterClient {
         stream = false,
       } = options;
 
+      // Ensure API key is trimmed and properly formatted
+      const apiKey = this.apiKey.trim();
+      
+      if (!apiKey) {
+        throw createError('OpenRouter API key is not configured', 401);
+      }
+
       const response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
+          'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
           'HTTP-Referer': 'https://fitbuddy.app',
           'X-Title': 'Fit Buddy - AI Fitness Companion',
@@ -78,9 +103,31 @@ export class OpenRouterClient {
       });
 
       if (!response.ok) {
-        const errorData = await response.json() as OpenRouterError;
+        let errorMessage = 'Unknown error';
+        try {
+          const errorData = await response.json() as OpenRouterError;
+          errorMessage = errorData.error?.message || `HTTP ${response.status}`;
+        } catch (e) {
+          errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+        }
+        
+        // Provide helpful error messages for common issues
+        if (response.status === 401) {
+          if (!this.apiKey || this.apiKey.trim() === '') {
+            throw createError(
+              'OpenRouter API key is missing. Please set OPENROUTER_API_KEY in your environment variables.',
+              401
+            );
+          } else {
+            throw createError(
+              'OpenRouter API key is invalid or expired. Please check your API key at https://openrouter.ai/keys',
+              401
+            );
+          }
+        }
+        
         throw createError(
-          `OpenRouter API error: ${errorData.error.message}`,
+          `OpenRouter API error: ${errorMessage}`,
           response.status
         );
       }
@@ -152,6 +199,12 @@ Image data: data:image/jpeg;base64,${imageBase64}`,
     } = {}
   ): Promise<string> {
     try {
+      // Check if API key is configured
+      if (!this.apiKey || this.apiKey.trim() === '') {
+        console.error('OpenRouter API key is not configured');
+        throw createError('OpenRouter API key is not configured', 401);
+      }
+
       const {
         systemPrompt = this.getDefaultSystemPrompt(),
         conversationHistory = [],
@@ -176,6 +229,10 @@ Image data: data:image/jpeg;base64,${imageBase64}`,
       console.error('Response generation error:', error);
       
       // Provide fallback responses for different error types
+      if (error.statusCode === 401) {
+        return 'I\'m currently unable to process requests because my AI service is not properly configured. Please contact support.';
+      }
+      
       if (error.statusCode === 429) {
         return 'I need a moment to think. Please try again in a few seconds! 🤔';
       }
