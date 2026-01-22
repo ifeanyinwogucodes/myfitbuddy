@@ -236,7 +236,20 @@ export class TelegramBotService {
         const onboardingResult = await this.aiService.startOnboarding(telegramId);
         
         if (onboardingResult.success) {
-          await this.bot.sendMessage(chatId, onboardingResult.data!.message);
+          const message = onboardingResult.data!.message;
+          await this.bot.sendMessage(chatId, message);
+          
+          // Store onboarding state in conversation context
+          await this.aiService.processMessage(telegramId, '/start', {
+            currentActivity: 'onboarding',
+            sessionData: {
+              onboardingState: {
+                step: 'name',
+                data: {},
+              },
+            },
+            lastInteraction: new Date(),
+          });
         } else {
           await this.bot.sendMessage(chatId, 
             'Welcome to Fit Buddy! 🎉\n\nI\'m your AI fitness companion, here to help you achieve your fitness goals with personalized workouts, nutrition advice, and motivation.\n\nLet\'s start by getting to know you better. What\'s your name?'
@@ -432,8 +445,17 @@ Just start chatting with me naturally! 😊`;
 
       console.log(`📨 Processing message from ${telegramId}: ${messageText.substring(0, 50)}...`);
 
+      // Get conversation context to check for onboarding/workout state
+      const conversationHistory = await this.aiService.getConversationHistory(telegramId, 1);
+      let context = undefined;
+      
+      // Try to extract context from conversation if available
+      if (conversationHistory.success && conversationHistory.metadata) {
+        // Context will be passed through the conversation
+      }
+
       // Process message through AI service
-      const aiResponse = await this.aiService.processMessage(telegramId, messageText);
+      const aiResponse = await this.aiService.processMessage(telegramId, messageText, context);
 
       if (aiResponse.success) {
         const response = aiResponse.data!;
@@ -441,8 +463,13 @@ Just start chatting with me naturally! 😊`;
         // Send the AI response
         await this.bot.sendMessage(msg.chat.id, response.message);
 
-        // Send suggestions as inline keyboard if available
-        if (response.suggestions && response.suggestions.length > 0) {
+        // Check if onboarding was completed
+        if (response.metadata?.userCreated) {
+          console.log(`✅ User ${telegramId} completed onboarding`);
+        }
+
+        // Send suggestions as inline keyboard if available (but not during onboarding)
+        if (response.suggestions && response.suggestions.length > 0 && !response.metadata?.onboardingStep) {
           const keyboard = {
             inline_keyboard: response.suggestions.slice(0, 4).map(suggestion => [
               { text: suggestion, callback_data: `suggest_${suggestion.toLowerCase().replace(/\s+/g, '_')}` }
